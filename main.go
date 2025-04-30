@@ -14,7 +14,6 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
-// Config holds all configuration parameters loaded from environment variables.
 type Config struct {
 	LdapURL           string
 	LdapBindDN        string
