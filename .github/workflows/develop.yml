@@ -17,7 +17,6 @@ jobs:
   # Builds the Dockerfile and pushes it to dockerhub and GHCR
   develop:
     name: Develop - Docker image
-    needs: check_versions
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
