@@ -7,13 +7,27 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/go-ldap/ldap/v3"
+	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 )
 
+// OutputMode defines how VCF files are generated
+type OutputMode string
+
+const (
+	OutputModeSingle   OutputMode = "single"
+	OutputModeMultiple OutputMode = "multiple"
+)
+
+// Config holds all configuration parameters loaded from environment variables.
 type Config struct {
 	LdapURL           string
 	LdapBindDN        string
@@ -23,7 +37,11 @@ type Config struct {
 	LdapUseTLS        bool
 	LdapSkipTLSVerify bool
 	AttributeMapping  map[string]string // vCard Field -> LDAP Attribute(s)
-	VcfOutputFile     string
+	VcfOutputFile     string            // File path for single mode, Dir path for multiple
+	VcfOutputMode     OutputMode
+	VcfFileMode       string // Octal string like "0644"
+	VcfFileOwner      string // User name or UID string
+	VcfFileGroup      string // Group name or GID string
 	CronSchedule      string
 }
 
@@ -63,7 +81,12 @@ func main() {
 		if err != nil {
 			log.Printf("Conversion failed: %v", err)
 		} else {
-			log.Printf("Conversion successful. VCF file written to %s", cfg.VcfOutputFile)
+			log.Printf("Conversion successful.")
+			if cfg.VcfOutputMode == OutputModeSingle {
+				log.Printf("VCF file written to %s", cfg.VcfOutputFile)
+			} else {
+				log.Printf("VCF files written to directory %s", cfg.VcfOutputFile)
+			}
 		}
 	}
 
@@ -86,9 +109,6 @@ func main() {
 		log.Fatalf("Error adding cron job (schedule '%s'): %v", cfg.CronSchedule, err)
 	}
 
-	// Run once immediately on startup as well? Optional.
-	// go conversionFunc() // Uncomment to run immediately in background
-
 	c.Start()
 	log.Println("Cron scheduler started. Waiting for jobs...")
 
@@ -99,17 +119,20 @@ func main() {
 // loadConfig reads configuration from environment variables.
 func loadConfig() (*Config, error) {
 	cfg := &Config{
-		// Provide defaults where sensible
 		LdapURL:           getEnv("LDAP_URL", ""),
 		LdapBindDN:        getEnv("LDAP_BIND_DN", ""),
 		LdapBindPassword:  getEnv("LDAP_BIND_PASSWORD", ""),
 		LdapBaseDN:        getEnv("LDAP_BASE_DN", ""),
-		LdapSearchFilter:  getEnv("LDAP_SEARCH_FILTER", "(objectClass=*)"), // Default: find everything
-		VcfOutputFile:     getEnv("VCF_OUTPUT_FILE", "contacts.vcf"),
+		LdapSearchFilter:  getEnv("LDAP_SEARCH_FILTER", "(objectClass=*)"),
+		VcfOutputFile:     getEnv("VCF_OUTPUT_FILE", "contacts.vcf"), // Default name/dir
 		CronSchedule:      getEnv("CRON_SCHEDULE", ""),
-		AttributeMapping:  make(map[string]string), // Parsed later
+		AttributeMapping:  make(map[string]string),
 		LdapUseTLS:        getEnvAsBool("LDAP_USE_TLS", false),
 		LdapSkipTLSVerify: getEnvAsBool("LDAP_SKIP_TLS_VERIFY", false),
+		VcfFileMode:       getEnv("VCF_FILE_MODE", ""),  // Default: OS default
+		VcfFileOwner:      getEnv("VCF_FILE_OWNER", ""), // Default: current user
+		VcfFileGroup:      getEnv("VCF_FILE_GROUP", ""), // Default: current group
+		VcfOutputMode:     OutputMode(strings.ToLower(getEnv("VCF_OUTPUT_MODE", string(OutputModeSingle)))),
 	}
 
 	// Basic validation
@@ -119,15 +142,25 @@ func loadConfig() (*Config, error) {
 	if cfg.LdapBaseDN == "" {
 		return nil, fmt.Errorf("LDAP_BASE_DN environment variable is required")
 	}
-	// Bind DN/Password can be empty for anonymous bind, but often required.
-	// Add more validation as needed.
+	if cfg.VcfOutputMode != OutputModeSingle && cfg.VcfOutputMode != OutputModeMultiple {
+		return nil, fmt.Errorf("invalid VCF_OUTPUT_MODE: must be 'single' or 'multiple'")
+	}
+	if cfg.VcfOutputFile == "" {
+		return nil, fmt.Errorf("VCF_OUTPUT_FILE environment variable cannot be empty")
+	}
+
+	// Validate file mode if set
+	if cfg.VcfFileMode != "" {
+		if _, err := parseFileMode(cfg.VcfFileMode); err != nil {
+			return nil, fmt.Errorf("invalid VCF_FILE_MODE: %w", err)
+		}
+	}
 
 	// Load the raw mapping string
 	mappingStr := getEnv("LDAP_ATTRIBUTE_MAPPING", "")
 	if mappingStr == "" {
 		return nil, fmt.Errorf("LDAP_ATTRIBUTE_MAPPING environment variable is required")
 	}
-	// Temporarily store the raw string; parsing happens in main
 	cfg.AttributeMapping["_raw_"] = mappingStr
 
 	return cfg, nil
@@ -138,7 +171,12 @@ func getEnv(key, fallback string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
 	}
-	log.Printf("Environment variable %s not set, using default: %s", key, fallback)
+	// Only log fallback usage if fallback is not empty, to avoid noise for optional vars
+	if fallback != "" {
+		log.Printf("Environment variable %s not set, using default: %s", key, fallback)
+	} else {
+		log.Printf("Environment variable %s not set, using no default.", key)
+	}
 	return fallback
 }
 
@@ -156,9 +194,7 @@ func getEnvAsBool(key string, fallback bool) bool {
 	return valBool
 }
 
-// parseMapping parses the LDAP_ATTRIBUTE_MAPPING string.
-// Format: "vCardField1:ldapAttr1,vCardField2;PARAM=val:ldapAttr2,N:sn;gn,..."
-// Returns the parsed mapping (vCard Field -> LDAP Attr), required LDAP attributes, and error.
+// parseMapping (same as before)
 func parseMapping(rawMapping map[string]string) (map[string]string, *ldapAttributes, error) {
 	mappingStr := rawMapping["_raw_"]
 	if mappingStr == "" {
@@ -188,7 +224,6 @@ func parseMapping(rawMapping map[string]string) (map[string]string, *ldapAttribu
 
 		// Special handling for the structured Name (N) field
 		if strings.HasPrefix(strings.ToUpper(vCardKey), vCardNameField) {
-			// Expecting ldapVal like "sn;gn" or "surnameAttr;givenNameAttr;..."
 			nameComponents := strings.Split(ldapVal, ";")
 			if len(nameComponents) >= 1 && nameComponents[0] != "" {
 				nameAttrMap["sn"] = nameComponents[0] // Surname
@@ -198,9 +233,7 @@ func parseMapping(rawMapping map[string]string) (map[string]string, *ldapAttribu
 				nameAttrMap["gn"] = nameComponents[1] // Given Name
 				ldapAttrSet[nameComponents[1]] = struct{}{}
 			}
-			// Add more components (Middle, Prefix, Suffix) if needed
 		} else {
-			// For regular fields, add the LDAP attribute to the set
 			ldapAttrSet[ldapVal] = struct{}{}
 		}
 	}
@@ -209,7 +242,6 @@ func parseMapping(rawMapping map[string]string) (map[string]string, *ldapAttribu
 		return nil, nil, fmt.Errorf("no valid mappings found in LDAP_ATTRIBUTE_MAPPING")
 	}
 
-	// Convert the set to a slice
 	allLdapAttrs := make([]string, 0, len(ldapAttrSet))
 	for attr := range ldapAttrSet {
 		allLdapAttrs = append(allLdapAttrs, attr)
@@ -223,9 +255,7 @@ func parseMapping(rawMapping map[string]string) (map[string]string, *ldapAttribu
 	return parsed, ldapInfo, nil
 }
 
-// parseVCardFieldKey breaks down a vCard field key like "TEL;TYPE=work;TYPE=voice"
-// into its name ("TEL") and parameters (map[string][]string).
-// For simplicity here, we only handle one value per param like "TYPE=work".
+// parseVCardFieldKey (same as before)
 func parseVCardFieldKey(key string) vCardField {
 	parts := strings.Split(key, ";")
 	field := vCardField{
@@ -237,18 +267,16 @@ func parseVCardFieldKey(key string) vCardField {
 		if len(paramParts) == 2 {
 			paramName := strings.ToUpper(strings.TrimSpace(paramParts[0]))
 			paramValue := strings.TrimSpace(paramParts[1])
-			// Simple approach: last parameter wins if duplicated
 			field.Parameters[paramName] = paramValue
 		} else {
-			// Handle valueless parameters if needed (e.g., ;PREF)
 			paramName := strings.ToUpper(strings.TrimSpace(paramParts[0]))
-			field.Parameters[paramName] = "" // Or handle as boolean flag
+			field.Parameters[paramName] = ""
 		}
 	}
 	return field
 }
 
-// runConversion connects to LDAP, searches, and generates the VCF file.
+// runConversion connects to LDAP, searches, and generates VCF based on output mode.
 func runConversion(cfg *Config, mapping map[string]string, ldapAttrs *ldapAttributes) error {
 	l, err := connectLDAP(cfg)
 	if err != nil {
@@ -260,39 +288,30 @@ func runConversion(cfg *Config, mapping map[string]string, ldapAttrs *ldapAttrib
 	if cfg.LdapBindDN != "" {
 		err = l.Bind(cfg.LdapBindDN, cfg.LdapBindPassword)
 		if err != nil {
-			// Mask password in log if present
 			maskedErr := strings.Replace(err.Error(), cfg.LdapBindPassword, "[REDACTED]", -1)
 			return fmt.Errorf("LDAP bind failed for DN %s: %s", cfg.LdapBindDN, maskedErr)
 		}
 		log.Printf("LDAP bind successful for DN: %s", cfg.LdapBindDN)
 	} else {
 		log.Println("Attempting anonymous LDAP bind.")
-		// Depending on server config, anonymous bind might require an explicit Bind() call
-		// or might work implicitly with the search. Test with your server.
-		// err = l.UnauthenticatedBind("") // Example if explicit call needed
-		// if err != nil {
-		//     return fmt.Errorf("LDAP anonymous bind failed: %w", err)
-		// }
 	}
 
-	// Ensure all necessary attributes (including name components) are requested
+	// Ensure all necessary attributes are requested
 	attributesToFetch := ldapAttrs.All
 	log.Printf("Requesting LDAP attributes: %v", attributesToFetch)
 	if len(attributesToFetch) == 0 {
 		log.Println("Warning: No LDAP attributes derived from mapping. Fetching all attributes (*).")
-		attributesToFetch = []string{"*"} // Or consider fetching a minimal default set
+		attributesToFetch = []string{"*"}
 	}
 
 	searchRequest := ldap.NewSearchRequest(
 		cfg.LdapBaseDN,
-		ldap.ScopeWholeSubtree, // Or ldap.ScopeSingleLevel, ldap.ScopeBaseObject
-		ldap.NeverDerefAliases, // Or ldap.DerefAlways, ldap.DerefFinding, ldap.DerefSearching
-		0,                      // Size limit (0 = server default)
-		0,                      // Time limit (0 = server default)
-		false,                  // Types only (false = fetch values)
-		cfg.LdapSearchFilter,   // The filter string
-		attributesToFetch,      // Attributes to retrieve
-		nil,                    // Controls (e.g., for paging)
+		ldap.ScopeWholeSubtree,
+		ldap.NeverDerefAliases,
+		0, 0, false,
+		cfg.LdapSearchFilter,
+		attributesToFetch,
+		nil,
 	)
 
 	log.Printf("Performing LDAP search with BaseDN='%s', Filter='%s'", cfg.LdapBaseDN, cfg.LdapSearchFilter)
@@ -304,34 +323,110 @@ func runConversion(cfg *Config, mapping map[string]string, ldapAttrs *ldapAttrib
 	log.Printf("LDAP search completed. Found %d entries.", len(sr.Entries))
 
 	// --- VCF File Generation ---
-	file, err := os.Create(cfg.VcfOutputFile)
-	if err != nil {
-		return fmt.Errorf("failed to create output file %s: %w", cfg.VcfOutputFile, err)
+	if cfg.VcfOutputMode == OutputModeSingle {
+		return generateSingleVCF(cfg, sr.Entries, mapping, ldapAttrs)
+	} else {
+		return generateMultipleVCFs(cfg, sr.Entries, mapping, ldapAttrs)
 	}
-	defer file.Close()
+}
+
+// generateSingleVCF creates one VCF file containing all entries.
+func generateSingleVCF(cfg *Config, entries []*ldap.Entry, mapping map[string]string, ldapAttrs *ldapAttributes) error {
+	filePath := cfg.VcfOutputFile
+	log.Printf("Generating single VCF file: %s", filePath)
+
+	// Ensure parent directory exists
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil { // Use a reasonable default mode for dir
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+
+	file, err := os.Create(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file %s: %w", filePath, err)
+	}
+	defer file.Close() // Close before applying permissions
 
 	writer := bufio.NewWriter(file)
-	defer writer.Flush() // Ensure buffer is written at the end
-
-	for _, entry := range sr.Entries {
+	entriesWritten := 0
+	for _, entry := range entries {
 		vcfEntry := generateVCardEntry(entry, mapping, ldapAttrs)
 		if vcfEntry != "" {
 			_, err = writer.WriteString(vcfEntry)
 			if err != nil {
-				log.Printf("Warning: Failed to write VCF entry for DN %s: %v", entry.DN, err)
-				// Decide whether to continue or return error
+				log.Printf("Warning: Failed to write VCF entry for DN %s to %s: %v", entry.DN, filePath, err)
+				// Continue writing other entries
+			} else {
+				entriesWritten++
 			}
 		} else {
-			log.Printf("Skipping VCF entry generation for DN %s (likely missing essential mapped fields)", entry.DN)
+			log.Printf("Skipping VCF entry generation for DN %s (missing essential mapped fields)", entry.DN)
 		}
 	}
 
-	return nil // Success
+	if err := writer.Flush(); err != nil {
+		log.Printf("Warning: Failed to flush writer for %s: %v", filePath, err)
+		// File might be incomplete, but proceed to permission setting
+	}
+	file.Close() // Explicit close before chmod/chown
+
+	log.Printf("Wrote %d entries to %s", entriesWritten, filePath)
+
+	// Apply permissions to the single file
+	if err := applyPermissions(filePath, cfg); err != nil {
+		// Log as warning, file is already created
+		log.Printf("Warning: Failed to apply permissions to %s: %v", filePath, err)
+	}
+
+	return nil
 }
 
-// connectLDAP establishes a connection to the LDAP server.
+// generateMultipleVCFs creates one VCF file per entry in a directory.
+func generateMultipleVCFs(cfg *Config, entries []*ldap.Entry, mapping map[string]string, ldapAttrs *ldapAttributes) error {
+	outputDir := cfg.VcfOutputFile
+	log.Printf("Generating multiple VCF files in directory: %s", outputDir)
+
+	// Ensure the output directory exists
+	if err := os.MkdirAll(outputDir, 0755); err != nil { // Use a reasonable default mode for dir
+		return fmt.Errorf("failed to create output directory %s: %w", outputDir, err)
+	}
+	// Note: Permissions for the directory itself are not set by VCF_FILE_*,
+	// manage directory permissions separately if needed.
+
+	filesWritten := 0
+	for _, entry := range entries {
+		vcfEntry := generateVCardEntry(entry, mapping, ldapAttrs)
+		if vcfEntry != "" {
+			// Generate unique filename
+			fileName := uuid.New().String() + ".vcf"
+			filePath := filepath.Join(outputDir, fileName)
+
+			// Write file content (using WriteFile for simplicity)
+			// Default permissions are used initially, then adjusted by applyPermissions
+			err := os.WriteFile(filePath, []byte(vcfEntry), 0666) // Temporary permissive mode
+			if err != nil {
+				log.Printf("Warning: Failed to write VCF file %s for DN %s: %v", filePath, entry.DN, err)
+				continue // Skip this entry, try the next one
+			}
+
+			// Apply permissions to the individual file
+			if err := applyPermissions(filePath, cfg); err != nil {
+				// Log as warning, file is already created
+				log.Printf("Warning: Failed to apply permissions to %s: %v", filePath, err)
+			}
+			filesWritten++
+
+		} else {
+			log.Printf("Skipping VCF file generation for DN %s (missing essential mapped fields)", entry.DN)
+		}
+	}
+
+	log.Printf("Wrote %d individual VCF files to %s", filesWritten, outputDir)
+	return nil
+}
+
+// connectLDAP (same as before)
 func connectLDAP(cfg *Config) (*ldap.Conn, error) {
-	// Parse URL to check scheme
 	u, err := url.Parse(cfg.LdapURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid LDAP_URL: %w", err)
@@ -357,12 +452,11 @@ func connectLDAP(cfg *Config) (*ldap.Conn, error) {
 		return nil, fmt.Errorf("cannot dial LDAP server: %w", err)
 	}
 
-	// Handle StartTLS if configured and not already using LDAPS
 	if !isTLS && cfg.LdapUseTLS {
 		log.Println("Attempting StartTLS...")
 		err = l.StartTLS(tlsConfig)
 		if err != nil {
-			l.Close() // Close connection if StartTLS fails
+			l.Close()
 			return nil, fmt.Errorf("StartTLS failed: %w", err)
 		}
 		log.Println("StartTLS successful.")
@@ -371,50 +465,45 @@ func connectLDAP(cfg *Config) (*ldap.Conn, error) {
 	return l, nil
 }
 
-// generateVCardEntry creates a single VCF entry string from an LDAP entry.
+// generateVCardEntry (same as before)
 func generateVCardEntry(entry *ldap.Entry, mapping map[string]string, ldapAttrs *ldapAttributes) string {
 	var sb strings.Builder
-	hasEssentialData := false // Track if we added at least one useful field
+	hasEssentialData := false
 
 	sb.WriteString("BEGIN:VCARD\n")
 	sb.WriteString("VERSION:3.0\n")
-	// Add UID based on DN or another unique attribute if desired
-	// sb.WriteString(fmt.Sprintf("UID:%s\n", entry.DN)) // Example
+	// Consider adding UID based on a stable LDAP attribute if available
+	// uidAttr := entry.GetAttributeValue("entryUUID") // Example
+	// if uidAttr != "" {
+	// 	sb.WriteString(fmt.Sprintf("UID:%s\n", uidAttr))
+	// }
 
 	// Process mapped fields
 	for vCardKey, ldapAttr := range mapping {
 		field := parseVCardFieldKey(vCardKey)
 
-		// Special handling for N (Name)
 		if field.Name == vCardNameField {
 			sn := entry.GetAttributeValue(ldapAttrs.NameAttrs["sn"])
 			gn := entry.GetAttributeValue(ldapAttrs.NameAttrs["gn"])
-			// Add more components (middle, prefix, suffix) if mapped
-
-			// Only write N field if at least surname or given name exists
 			if sn != "" || gn != "" {
-				// Format: N:Family;Given;Middle;Prefix;Suffix (leave empty components blank)
 				sb.WriteString(fmt.Sprintf("%s:%s;%s;;;\n", field.Name, escapeVCardValue(sn), escapeVCardValue(gn)))
 				hasEssentialData = true
 			}
-			continue // Skip generic processing for N field
+			continue
 		}
 
-		// Generic handling for other fields
 		values := entry.GetAttributeValues(ldapAttr)
 		if len(values) > 0 {
-			hasEssentialData = true // Mark that we have data for this entry
+			hasEssentialData = true
 			for _, value := range values {
 				if value != "" {
 					sb.WriteString(field.Name)
-					// Add parameters
 					for paramName, paramValue := range field.Parameters {
 						sb.WriteString(";")
 						sb.WriteString(paramName)
 						if paramValue != "" {
 							sb.WriteString("=")
-							// Parameter values might need escaping too, but often simple types
-							sb.WriteString(paramValue)
+							sb.WriteString(paramValue) // Basic param value handling
 						}
 					}
 					sb.WriteString(":")
@@ -425,9 +514,8 @@ func generateVCardEntry(entry *ldap.Entry, mapping map[string]string, ldapAttrs 
 		}
 	}
 
-	// Add FN (Formatted Name) - often required. Try to construct it.
-	// Attempt to get CN first, otherwise combine GN and SN.
-	fn := entry.GetAttributeValue("cn") // Common Name is often used for FN
+	// Add FN (Formatted Name)
+	fn := entry.GetAttributeValue("cn")
 	if fn == "" {
 		gn := entry.GetAttributeValue(ldapAttrs.NameAttrs["gn"])
 		sn := entry.GetAttributeValue(ldapAttrs.NameAttrs["sn"])
@@ -438,22 +526,121 @@ func generateVCardEntry(entry *ldap.Entry, mapping map[string]string, ldapAttrs 
 		sb.WriteString(fmt.Sprintf("FN:%s\n", escapeVCardValue(fn)))
 		hasEssentialData = true
 	} else if !hasEssentialData {
-		// If we still have no FN and no other essential data, this entry is likely useless
-		return "" // Return empty string to indicate skipping this entry
+		return "" // Skip entry if no FN and no other mapped data found
 	}
+
+	// Add REV (Revision timestamp) - useful for tracking changes
+	sb.WriteString(fmt.Sprintf("REV:%s\n", time.Now().UTC().Format("20060102T150405Z")))
 
 	sb.WriteString("END:VCARD\n")
 
 	return sb.String()
 }
 
-// escapeVCardValue handles basic escaping for VCF field values.
-// VCF 3.0 requires escaping backslash (\), comma (,), semicolon (;), and newline (\n).
+// escapeVCardValue (same as before)
 func escapeVCardValue(value string) string {
 	value = strings.ReplaceAll(value, "\\", "\\\\")
 	value = strings.ReplaceAll(value, ",", "\\,")
 	value = strings.ReplaceAll(value, ";", "\\;")
-	// Newlines should be encoded as literal \n
 	value = strings.ReplaceAll(value, "\n", "\\n")
 	return value
+}
+
+// parseFileMode converts an octal string like "0644" to os.FileMode.
+func parseFileMode(modeStr string) (os.FileMode, error) {
+	mode, err := strconv.ParseUint(modeStr, 8, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid octal mode string '%s': %w", modeStr, err)
+	}
+	return os.FileMode(mode), nil
+}
+
+// applyPermissions sets the mode and ownership of the specified file/directory.
+func applyPermissions(path string, cfg *Config) error {
+	var appliedMode bool
+	var appliedOwner bool
+
+	// 1. Set File Mode (chmod)
+	if cfg.VcfFileMode != "" {
+		mode, err := parseFileMode(cfg.VcfFileMode)
+		if err != nil {
+			// Should have been caught during config load, but double-check
+			return fmt.Errorf("internal error parsing file mode: %w", err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			// Log error but continue to chown if possible
+			log.Printf("Warning: Failed to chmod %s to %s: %v (Permissions issue?)", path, cfg.VcfFileMode, err)
+		} else {
+			log.Printf("Applied mode %s to %s", cfg.VcfFileMode, path)
+			appliedMode = true
+		}
+	}
+
+	// 2. Set File Ownership (chown)
+	if cfg.VcfFileOwner != "" || cfg.VcfFileGroup != "" {
+		uid := -1 // -1 means don't change UID
+		gid := -1 // -1 means don't change GID
+		var err error
+
+		// Lookup UID
+		if cfg.VcfFileOwner != "" {
+			u, lookupErr := user.Lookup(cfg.VcfFileOwner)
+			if lookupErr == nil {
+				uid, err = strconv.Atoi(u.Uid)
+				if err != nil {
+					log.Printf("Warning: Could not convert looked up UID '%s' for user '%s' to int: %v", u.Uid, cfg.VcfFileOwner, err)
+					uid = -1 // Reset on error
+				}
+			} else {
+				// Try parsing as numeric UID directly
+				uid, err = strconv.Atoi(cfg.VcfFileOwner)
+				if err != nil {
+					log.Printf("Warning: Could not find user '%s' and it's not a numeric UID: %v", cfg.VcfFileOwner, lookupErr)
+					uid = -1 // Reset on error
+				}
+			}
+		}
+
+		// Lookup GID
+		if cfg.VcfFileGroup != "" {
+			g, lookupErr := user.LookupGroup(cfg.VcfFileGroup)
+			if lookupErr == nil {
+				gid, err = strconv.Atoi(g.Gid)
+				if err != nil {
+					log.Printf("Warning: Could not convert looked up GID '%s' for group '%s' to int: %v", g.Gid, cfg.VcfFileGroup, err)
+					gid = -1 // Reset on error
+				}
+			} else {
+				// Try parsing as numeric GID directly
+				gid, err = strconv.Atoi(cfg.VcfFileGroup)
+				if err != nil {
+					log.Printf("Warning: Could not find group '%s' and it's not a numeric GID: %v", cfg.VcfFileGroup, lookupErr)
+					gid = -1 // Reset on error
+				}
+			}
+		}
+
+		// Apply Chown if UID or GID was successfully determined
+		if uid != -1 || gid != -1 {
+			log.Printf("Attempting to chown %s to UID=%d, GID=%d", path, uid, gid)
+			if err := os.Chown(path, uid, gid); err != nil {
+				// Check for specific permission error (EPERM)
+				if perr, ok := err.(*os.PathError); ok && perr.Err == syscall.EPERM {
+					log.Printf("Warning: Permission denied to chown %s. Ensure the process runs with sufficient privileges (e.g., as root or with capabilities).", path)
+				} else {
+					log.Printf("Warning: Failed to chown %s: %v", path, err)
+				}
+			} else {
+				log.Printf("Applied ownership UID=%d, GID=%d to %s", uid, gid, path)
+				appliedOwner = true
+			}
+		}
+	}
+
+	if !appliedMode && !appliedOwner {
+		// No permissions were configured or applied
+		return nil
+	}
+
+	return nil // Return nil even if warnings occurred, as file ops succeeded
 }
