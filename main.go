@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/url"
@@ -15,7 +16,6 @@ import (
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
-	"github.com/google/uuid"
 	"github.com/robfig/cron/v3"
 )
 
@@ -397,8 +397,7 @@ func generateMultipleVCFs(cfg *Config, entries []*ldap.Entry, mapping map[string
 	for _, entry := range entries {
 		vcfEntry := generateVCardEntry(entry, mapping, ldapAttrs)
 		if vcfEntry != "" {
-			// Generate unique filename
-			fileName := uuid.New().String() + ".vcf"
+			fileName := base64.RawURLEncoding.EncodeToString([]byte(entry.DN)) + ".vcf"
 			filePath := filepath.Join(outputDir, fileName)
 
 			// Write file content (using WriteFile for simplicity)
