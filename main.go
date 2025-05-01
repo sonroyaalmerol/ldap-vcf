@@ -56,7 +56,7 @@ type ldapAttributes struct {
 
 const (
 	vCardNameField = "N"
-	ldapEntryUUID  = "entryUUID"
+	ldapEntryUUID  = "mail"
 )
 
 func main() {
