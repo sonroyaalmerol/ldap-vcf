@@ -302,6 +302,7 @@ func runConversion(
 			if entryCN == "" {
 				continue
 			}
+			entryCN = strings.Split(entryCN, "@")[0]
 			newDir := filepath.Join(cfg.GenerateDirs, entryCN)
 			if err := os.MkdirAll(newDir, 0755); err == nil {
 				if err := applyPermissions(newDir, cfg); err != nil {
