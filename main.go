@@ -308,7 +308,7 @@ func runConversion(cfg *Config, mapping map[string]string, ldapAttrs *ldapAttrib
 	go func() {
 		if cfg.GenerateDirs != "" {
 			for _, entry := range sr.Entries {
-				entryCN := entry.GetAttributeValue("cn")
+				entryCN := entry.GetAttributeValue("uid")
 				newDir := filepath.Join(cfg.GenerateDirs, entryCN)
 				if err = os.MkdirAll(newDir, 0755); err == nil {
 					if err := applyPermissions(newDir, cfg); err != nil {
