@@ -12,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/go-ldap/ldap/v3"
 	"github.com/google/uuid"
@@ -514,8 +513,8 @@ func generateVCardEntry(
 	} else if !hasEssentialData {
 		return ""
 	}
-	sb.WriteString(fmt.Sprintf("REV:%s\n", time.Now().UTC().Format(
-		"20060102T150405Z")))
+	//sb.WriteString(fmt.Sprintf("REV:%s\n", time.Now().UTC().Format(
+	//	"20060102T150405Z")))
 	sb.WriteString("END:VCARD\n")
 	return sb.String()
 }
