@@ -305,6 +305,20 @@ func runConversion(cfg *Config, mapping map[string]string, ldapAttrs *ldapAttrib
 
 	log.Printf("LDAP search completed. Found %d entries.", len(sr.Entries))
 
+	go func() {
+		if cfg.GenerateDirs != "" {
+			for _, entry := range sr.Entries {
+				entryCN := entry.GetAttributeValue("cn")
+				newDir := filepath.Join(cfg.GenerateDirs, entryCN)
+				if err = os.MkdirAll(newDir, 0755); err == nil {
+					if err := applyPermissions(newDir, cfg); err != nil {
+						log.Printf("Warning: Failed to apply permissions to %s: %v", newDir, err)
+					}
+				}
+			}
+		}
+	}()
+
 	if cfg.VcfOutputMode == OutputModeSingle {
 		return generateSingleVCF(cfg, sr.Entries, mapping, ldapAttrs)
 	} else {
@@ -357,23 +371,6 @@ func generateSingleVCF(cfg *Config, entries []*ldap.Entry, mapping map[string]st
 	return nil
 }
 
-func getCNFromDN(dnString string) (string, error) {
-	dn, err := ldap.ParseDN(dnString)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse DN '%s': %w", dnString, err)
-	}
-
-	for _, rdn := range dn.RDNs {
-		for _, ava := range rdn.Attributes {
-			if strings.EqualFold(ava.Type, "CN") {
-				return ava.Value, nil
-			}
-		}
-	}
-
-	return "", fmt.Errorf("CN not found in DN: %s", dnString)
-}
-
 func generateMultipleVCFs(cfg *Config, entries []*ldap.Entry, mapping map[string]string, ldapAttrs *ldapAttributes) error {
 	outputDir := cfg.VcfOutputFile
 	log.Printf("Generating multiple VCF files in directory: %s", outputDir)
@@ -404,17 +401,6 @@ func generateMultipleVCFs(cfg *Config, entries []*ldap.Entry, mapping map[string
 
 			if err := applyPermissions(filePath, cfg); err != nil {
 				log.Printf("Warning: Failed to apply permissions to %s: %v", filePath, err)
-			}
-
-			if cfg.GenerateDirs != "" {
-				if entryCN, err := getCNFromDN(entry.DN); err == nil {
-					newDir := filepath.Join(cfg.GenerateDirs, entryCN)
-					if err = os.MkdirAll(newDir, 0755); err == nil {
-						if err := applyPermissions(newDir, cfg); err != nil {
-							log.Printf("Warning: Failed to apply permissions to %s: %v", filePath, err)
-						}
-					}
-				}
 			}
 
 			filesWritten++
