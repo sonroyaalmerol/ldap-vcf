@@ -381,7 +381,7 @@ func generateMultipleVCFs(
 		fileNameBase := ""
 		if entry.DN != "" {
 			fileNameBase = base64.URLEncoding.EncodeToString([]byte(
-				entry.DN))
+				entry.GetAttributeValue("uid")))
 		} else {
 			log.Printf("Warning: Entry found with empty DN. Using UUID " +
 				"for filename.")
@@ -548,7 +548,7 @@ func applyPermissions(path string, cfg *Config) error {
 			log.Printf("Warning: Failed to chmod %s to %s: %v (Permissions "+
 				"issue?)", path, cfg.VcfFileMode, err)
 		} else {
-			log.Printf("Applied mode %s to %s", cfg.VcfFileMode, path)
+			// log.Printf("Applied mode %s to %s", cfg.VcfFileMode, path)
 		}
 	}
 	if cfg.VcfFileOwner != "" || cfg.VcfFileGroup != "" {
@@ -595,8 +595,9 @@ func applyPermissions(path string, cfg *Config) error {
 			}
 		}
 		if uid != -1 || gid != -1 {
-			log.Printf("Attempting to chown %s to UID=%d, GID=%d", path,
-				uid, gid)
+			/*log.Printf("Attempting to chown %s to UID=%d, GID=%d", path,
+			uid, gid)
+			*/
 			if err := os.Chown(path, uid, gid); err != nil {
 				if perr, ok := err.(*os.PathError); ok && perr.Err ==
 					syscall.EPERM {
@@ -607,8 +608,9 @@ func applyPermissions(path string, cfg *Config) error {
 					log.Printf("Warning: Failed to chown %s: %v", path, err)
 				}
 			} else {
-				log.Printf("Applied ownership UID=%d, GID=%d to %s", uid,
-					gid, path)
+				/* log.Printf("Applied ownership UID=%d, GID=%d to %s", uid,
+				gid, path)
+				*/
 			}
 		}
 	}
