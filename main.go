@@ -287,6 +287,8 @@ func runConversion(cfg *Config, mapping map[string]string, ldapAttrs *ldapAttrib
 		attributesToFetch = []string{"*"}
 	}
 
+	attributesToFetch = append(attributesToFetch, "uid")
+
 	searchRequest := ldap.NewSearchRequest(
 		cfg.LdapBaseDN,
 		ldap.ScopeWholeSubtree,
@@ -309,6 +311,9 @@ func runConversion(cfg *Config, mapping map[string]string, ldapAttrs *ldapAttrib
 		if cfg.GenerateDirs != "" {
 			for _, entry := range sr.Entries {
 				entryCN := entry.GetAttributeValue("uid")
+				if entryCN == "" {
+					continue
+				}
 				newDir := filepath.Join(cfg.GenerateDirs, entryCN)
 				if err = os.MkdirAll(newDir, 0755); err == nil {
 					if err := applyPermissions(newDir, cfg); err != nil {
