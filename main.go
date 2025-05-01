@@ -276,7 +276,6 @@ func runConversion(
 			"Fetching all attributes (*).")
 		attributesToFetch = []string{"*"}
 	}
-	attributesToFetch = append(attributesToFetch, "mail")
 	searchRequest := ldap.NewSearchRequest(
 		cfg.LdapBaseDN,
 		ldap.ScopeWholeSubtree,
