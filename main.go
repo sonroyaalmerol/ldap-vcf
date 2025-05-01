@@ -276,7 +276,7 @@ func runConversion(
 			"Fetching all attributes (*).")
 		attributesToFetch = []string{"*"}
 	}
-	attributesToFetch = append(attributesToFetch, "uid")
+	attributesToFetch = append(attributesToFetch, "mail")
 	searchRequest := ldap.NewSearchRequest(
 		cfg.LdapBaseDN,
 		ldap.ScopeWholeSubtree,
@@ -299,7 +299,7 @@ func runConversion(
 			return
 		}
 		for _, entry := range sr.Entries {
-			entryCN := entry.GetAttributeValue("uid")
+			entryCN := entry.GetAttributeValue("mail")
 			if entryCN == "" {
 				continue
 			}
@@ -381,7 +381,7 @@ func generateMultipleVCFs(
 		fileNameBase := ""
 		if entry.DN != "" {
 			fileNameBase = base64.URLEncoding.EncodeToString([]byte(
-				entry.GetAttributeValue("uid")))
+				entry.GetAttributeValue("mail")))
 		} else {
 			log.Printf("Warning: Entry found with empty DN. Using UUID " +
 				"for filename.")
