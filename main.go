@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
@@ -9,9 +10,11 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/go-ldap/ldap/v3"
 	"github.com/google/uuid"
@@ -317,6 +320,17 @@ func runConversion(
 	return generateMultipleVCFs(cfg, sr.Entries, mapping, ldapAttrs)
 }
 
+func removeRevLines(content []byte) []byte {
+	var result [][]byte
+	lines := bytes.Split(content, []byte("\n"))
+	for _, line := range lines {
+		if !bytes.HasPrefix(line, []byte("REV:")) {
+			result = append(result, line)
+		}
+	}
+	return bytes.Join(result, []byte("\n"))
+}
+
 func generateSingleVCF(
 	cfg *Config,
 	entries []*ldap.Entry,
@@ -337,8 +351,14 @@ func generateSingleVCF(
 				"(missing essential mapped fields)", entry.DN)
 		}
 	}
-	newContent := sb.String()
+
+	vcfEntry := sb.String()
+	newContentBytes := removeRevLines([]byte(vcfEntry))
+	newContent := string(newContentBytes)
+
 	oldContent, err := os.ReadFile(filePath)
+	oldContent = removeRevLines(oldContent)
+
 	if err == nil && string(oldContent) == newContent {
 		log.Printf("No changes detected in %s, skipping write", filePath)
 		return nil
@@ -347,7 +367,7 @@ func generateSingleVCF(
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create directory %s: %w", dir, err)
 	}
-	if err := os.WriteFile(filePath, []byte(newContent), 0666); err != nil {
+	if err := os.WriteFile(filePath, []byte(vcfEntry), 0666); err != nil {
 		return fmt.Errorf("failed to write output file %s: %w", filePath,
 			err)
 	}
@@ -366,8 +386,7 @@ func generateMultipleVCFs(
 	ldapAttrs *ldapAttributes,
 ) error {
 	outputDir := cfg.VcfOutputFile
-	log.Printf("Generating multiple VCF files in directory: %s",
-		outputDir)
+	log.Printf("Generating multiple VCF files in directory: %s", outputDir)
 	dirCreated := false
 	filesWritten := 0
 	for _, entry := range entries {
@@ -388,10 +407,17 @@ func generateMultipleVCFs(
 		}
 		fileName := fileNameBase + ".vcf"
 		filePath := filepath.Join(outputDir, fileName)
+
+		newContentBytes := removeRevLines([]byte(vcfEntry))
+		newContent := string(newContentBytes)
+
 		oldContent, err := os.ReadFile(filePath)
-		if err == nil && string(oldContent) == vcfEntry {
+		oldContent = removeRevLines(oldContent)
+
+		if err == nil && string(oldContent) == newContent {
 			continue
 		}
+
 		if !dirCreated {
 			if err := os.MkdirAll(outputDir, 0755); err != nil {
 				return fmt.Errorf("failed to create output directory "+
@@ -468,7 +494,16 @@ func generateVCardEntry(
 		log.Printf("Warning: Could not determine UID for entry (DN: %s). "+
 			"Skipping UID field.", entry.DN)
 	}
-	for vCardKey, ldapAttr := range mapping {
+
+	keys := make([]string, 0)
+	for k := range mapping {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys)
+
+	for _, vCardKey := range keys {
+		ldapAttr := mapping[vCardKey]
 		field := parseVCardFieldKey(vCardKey)
 		if field.Name == vCardNameField {
 			sn := entry.GetAttributeValue(ldapAttrs.NameAttrs["sn"])
@@ -501,6 +536,7 @@ func generateVCardEntry(
 			}
 		}
 	}
+
 	fn := entry.GetAttributeValue("cn")
 	if fn == "" {
 		gn := entry.GetAttributeValue(ldapAttrs.NameAttrs["gn"])
@@ -513,8 +549,7 @@ func generateVCardEntry(
 	} else if !hasEssentialData {
 		return ""
 	}
-	//sb.WriteString(fmt.Sprintf("REV:%s\n", time.Now().UTC().Format(
-	//	"20060102T150405Z")))
+	sb.WriteString(fmt.Sprintf("REV:%s\n", time.Now().UTC().Format("20060102T150405Z")))
 	sb.WriteString("END:VCARD\n")
 	return sb.String()
 }
